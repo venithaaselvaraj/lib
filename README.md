@@ -1,6 +1,6 @@
 # Community Library Management System
 
-A comprehensive web-based library management system built with React.js frontend and Node.js/Express backend with SQLite database. This system helps libraries manage their books, members, and borrowing operations efficiently.
+A comprehensive web-based library management system built with React.js frontend and Node.js/Express backend with **MongoDB** database. This system helps libraries manage their books, members, and borrowing operations efficiently.
 
 ## 🚀 Features
 
@@ -52,16 +52,19 @@ A comprehensive web-based library management system built with React.js frontend
 ### Backend
 - **Node.js** - JavaScript runtime
 - **Express.js** - Web framework
-- **SQLite3** - Lightweight database
+- **MongoDB** - NoSQL database with Mongoose ODM
 - **CORS** - Cross-origin resource sharing
 - **Express Validator** - Input validation
 - **Moment.js** - Date handling
+- **Mongoose** - MongoDB object modeling
 
 ## 📦 Installation & Setup
 
 ### Prerequisites
 - Node.js (v14 or higher)
 - npm or yarn package manager
+- **MongoDB** (local installation or MongoDB Atlas)
+- **MongoDB Compass** (optional, for database visualization)
 
 ### 1. Clone the Repository
 ```bash
@@ -83,14 +86,34 @@ cd ../client
 npm install
 ```
 
-### 3. Initialize Database
+### 3. Setup MongoDB Database
+
+#### Option A: Local MongoDB
+1. Install MongoDB locally on your system
+2. Start MongoDB service: `mongod`
+3. Create a `.env` file in the server directory:
+```bash
+# Copy example environment file
+cp server/.env.example server/.env
+```
+
+#### Option B: MongoDB Atlas (Cloud)
+1. Create a free account at [MongoDB Atlas](https://www.mongodb.com/atlas)
+2. Create a new cluster and database
+3. Get your connection string
+4. Update `server/.env`:
+```bash
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/library_management?retryWrites=true&w=majority
+```
+
+### 4. Initialize Database with Sample Data
 ```bash
 # From the server directory
 cd server
 npm run init-db
 ```
 
-### 4. Start the Application
+### 5. Start the Application
 
 #### Development Mode (both server and client)
 ```bash
@@ -111,64 +134,60 @@ The application will be available at:
 - Frontend: http://localhost:3000
 - Backend API: http://localhost:5000
 
-## 📁 Project Structure
+## 📊 MongoDB Collections
 
+The system uses the following MongoDB collections:
+
+### Books Collection
+```javascript
+{
+  _id: ObjectId,
+  title: String,
+  author: String,
+  isbn: String,
+  genre: String,
+  publication_year: Number,
+  total_copies: Number,
+  available_copies: Number,
+  description: String,
+  cover_image: String,
+  createdAt: Date,
+  updatedAt: Date
+}
 ```
-community-library-management/
-├── client/                     # React frontend
-│   ├── public/
-│   ├── src/
-│   │   ├── components/         # Reusable components
-│   │   ├── pages/             # Page components
-│   │   ├── services/          # API services
-│   │   ├── App.js
-│   │   └── index.js
-│   └── package.json
-├── server/                     # Express backend
-│   ├── database/              # Database setup and models
-│   ├── routes/                # API routes
-│   ├── scripts/               # Database scripts
-│   ├── index.js               # Server entry point
-│   └── package.json
-├── package.json               # Root package.json
-└── README.md
+
+### Members Collection
+```javascript
+{
+  _id: ObjectId,
+  name: String,
+  email: String,
+  phone: String,
+  address: String,
+  membership_date: Date,
+  membership_status: String, // 'active', 'inactive', 'suspended'
+  max_books: Number,
+  createdAt: Date,
+  updatedAt: Date
+}
 ```
 
-## 🗄️ Database Schema
-
-### Books Table
-- `id` - Primary key
-- `title` - Book title
-- `author` - Book author
-- `isbn` - ISBN number
-- `genre` - Book genre
-- `publication_year` - Year published
-- `total_copies` - Total copies available
-- `available_copies` - Currently available copies
-- `description` - Book description
-- `created_at` - Record creation timestamp
-
-### Members Table
-- `id` - Primary key
-- `name` - Member full name
-- `email` - Email address (unique)
-- `phone` - Phone number
-- `address` - Physical address
-- `membership_date` - Date joined
-- `membership_status` - active/inactive
-- `max_books` - Maximum books allowed
-- `created_at` - Record creation timestamp
-
-### Borrowing Transactions Table
-- `id` - Primary key
-- `book_id` - Foreign key to books
-- `member_id` - Foreign key to members
-- `borrow_date` - Date borrowed
-- `due_date` - Due date
-- `return_date` - Date returned (if returned)
-- `status` - borrowed/returned
-- `fine_amount` - Fine charged
-- `notes` - Additional notes
+### BorrowingTransactions Collection
+```javascript
+{
+  _id: ObjectId,
+  book_id: ObjectId, // Reference to Books
+  member_id: ObjectId, // Reference to Members
+  borrow_date: Date,
+  due_date: Date,
+  return_date: Date,
+  status: String, // 'borrowed', 'returned', 'overdue'
+  fine_amount: Number,
+  notes: String,
+  createdAt: Date,
+  updatedAt: Date
+}
+```
 
 ## 🔧 API Endpoints
 
@@ -202,6 +221,12 @@ community-library-management/
 - `GET /api/dashboard/overdue-summary` - Get overdue summary
 
 ## 🎯 Usage Guide
+
+### Viewing Data in MongoDB Compass
+1. Open MongoDB Compass
+2. Connect to your MongoDB instance
+3. Navigate to the `library_management` database
+4. Explore the collections: `books`, `members`, `borrowingtransactions`
 
 ### Adding Books
 1. Navigate to Books section
@@ -243,12 +268,20 @@ Create `.env` files for different environments:
 
 ```bash
 # Server .env
+MONGODB_URI=mongodb://localhost:27017/library_management
 PORT=5000
 NODE_ENV=production
 
 # Client .env
 REACT_APP_API_URL=http://your-api-domain.com/api
 ```
+
+### MongoDB Atlas Deployment
+For production, use MongoDB Atlas:
+1. Create a MongoDB Atlas cluster
+2. Whitelist your server IP addresses
+3. Create database user with appropriate permissions
+4. Use the connection string in your production environment
 
 ### Docker Deployment (Optional)
 ```dockerfile
@@ -261,6 +294,15 @@ COPY . .
 EXPOSE 5000
 CMD ["npm", "start"]
 ```
+
+## 🔍 MongoDB Features Used
+
+- **Mongoose ODM** for object modeling and validation
+- **Aggregation Pipeline** for complex queries and analytics
+- **Text Indexing** for efficient search functionality
+- **Population** for referencing between collections
+- **Virtuals** for calculated fields
+- **Middleware** for data validation and processing
 
 ## 🤝 Contributing
 
@@ -290,7 +332,9 @@ For support and questions:
 - [ ] Mobile app development
 - [ ] Multi-library support
 - [ ] Integration with external book databases
+- [ ] MongoDB Atlas Search integration
+- [ ] Real-time notifications with MongoDB Change Streams
 
 ---
 
-Built with ❤️ for community libraries everywhere!
+Built with ❤️ for community libraries everywhere using **MongoDB**!
