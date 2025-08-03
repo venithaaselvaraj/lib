@@ -1,118 +1,100 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../database/db');
+const Book = require('../models/Book');
+const Member = require('../models/Member');
+const BorrowingTransaction = require('../models/BorrowingTransaction');
 const moment = require('moment');
 const { body, validationResult } = require('express-validator');
 
 // Get all borrowing transactions with optional filters
-router.get('/', (req, res) => {
-  const { status, member_id, book_id, page = 1, limit = 10, overdue } = req.query;
-  const offset = (page - 1) * limit;
-  
-  let sql = `
-    SELECT bt.*, 
-           b.title, b.author, b.isbn,
-           m.name as member_name, m.email as member_email
-    FROM borrowing_transactions bt
-    JOIN books b ON bt.book_id = b.id
-    JOIN members m ON bt.member_id = m.id
-    WHERE 1=1
-  `;
-  let params = [];
-  
-  if (status) {
-    sql += ' AND bt.status = ?';
-    params.push(status);
-  }
-  
-  if (member_id) {
-    sql += ' AND bt.member_id = ?';
-    params.push(member_id);
-  }
-  
-  if (book_id) {
-    sql += ' AND bt.book_id = ?';
-    params.push(book_id);
-  }
-  
-  if (overdue === 'true') {
-    sql += ' AND bt.status = "borrowed" AND bt.due_date < datetime("now")';
-  }
-  
-  sql += ' ORDER BY bt.borrow_date DESC LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), parseInt(offset));
-  
-  db.all(sql, params, (err, transactions) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+router.get('/', async (req, res) => {
+  try {
+    const { status, member_id, book_id, page = 1, limit = 10, overdue } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
     
-    // Calculate fines for overdue books
-    const processedTransactions = transactions.map(transaction => {
-      if (transaction.status === 'borrowed' && moment(transaction.due_date).isBefore(moment())) {
-        const daysOverdue = moment().diff(moment(transaction.due_date), 'days');
-        const finePerDay = 0.50; // $0.50 per day
-        transaction.calculated_fine = daysOverdue * finePerDay;
-      }
-      return transaction;
-    });
-    
-    // Get total count
-    let countSql = 'SELECT COUNT(*) as total FROM borrowing_transactions bt WHERE 1=1';
-    let countParams = [];
+    let query = {};
     
     if (status) {
-      countSql += ' AND bt.status = ?';
-      countParams.push(status);
-    }
-    if (member_id) {
-      countSql += ' AND bt.member_id = ?';
-      countParams.push(member_id);
-    }
-    if (book_id) {
-      countSql += ' AND bt.book_id = ?';
-      countParams.push(book_id);
-    }
-    if (overdue === 'true') {
-      countSql += ' AND bt.status = "borrowed" AND bt.due_date < datetime("now")';
+      query.status = status;
     }
     
-    db.get(countSql, countParams, (err, result) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
+    if (member_id) {
+      query.member_id = member_id;
+    }
+    
+    if (book_id) {
+      query.book_id = book_id;
+    }
+    
+    if (overdue === 'true') {
+      query.status = 'borrowed';
+      query.due_date = { $lt: new Date() };
+    }
+    
+    const transactions = await BorrowingTransaction.find(query)
+      .populate('book_id', 'title author isbn')
+      .populate('member_id', 'name email')
+      .sort({ borrow_date: -1 })
+      .skip(skip)
+      .limit(limitNum);
+    
+    // Add calculated fine for overdue books
+    const processedTransactions = transactions.map(transaction => {
+      const transactionObj = transaction.toObject();
+      if (transaction.status === 'borrowed' && moment(transaction.due_date).isBefore(moment())) {
+        const daysOverdue = moment().diff(moment(transaction.due_date), 'days');
+        const finePerDay = 0.50;
+        transactionObj.calculated_fine = daysOverdue * finePerDay;
       }
-      
-      res.json({
-        transactions: processedTransactions,
-        pagination: {
-          total: result.total,
-          page: parseInt(page),
-          limit: parseInt(limit),
-          totalPages: Math.ceil(result.total / limit)
-        }
-      });
+      // Add member name and email for easier access
+      if (transaction.member_id) {
+        transactionObj.member_name = transaction.member_id.name;
+        transactionObj.member_email = transaction.member_id.email;
+      }
+      // Add book title and author for easier access
+      if (transaction.book_id) {
+        transactionObj.title = transaction.book_id.title;
+        transactionObj.author = transaction.book_id.author;
+        transactionObj.isbn = transaction.book_id.isbn;
+      }
+      return transactionObj;
     });
-  });
+    
+    const total = await BorrowingTransaction.countDocuments(query);
+    
+    res.json({
+      transactions: processedTransactions,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching transactions:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Borrow a book
 router.post('/borrow', [
-  body('book_id').isInt().withMessage('Valid book ID is required'),
-  body('member_id').isInt().withMessage('Valid member ID is required'),
+  body('book_id').isMongoId().withMessage('Valid book ID is required'),
+  body('member_id').isMongoId().withMessage('Valid member ID is required'),
   body('due_date').isISO8601().withMessage('Valid due date is required')
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-  
-  const { book_id, member_id, due_date, notes } = req.body;
-  
-  // Check if book is available
-  db.get('SELECT * FROM books WHERE id = ?', [book_id], (err, book) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
+    
+    const { book_id, member_id, due_date, notes } = req.body;
+    
+    // Check if book exists and is available
+    const book = await Book.findById(book_id);
     if (!book) {
       return res.status(404).json({ error: 'Book not found' });
     }
@@ -120,71 +102,67 @@ router.post('/borrow', [
       return res.status(400).json({ error: 'Book is not available' });
     }
     
-    // Check member's borrowing limit
-    db.get(`
-      SELECT m.*, COUNT(bt.id) as active_borrowings 
-      FROM members m
-      LEFT JOIN borrowing_transactions bt ON m.id = bt.member_id AND bt.status = 'borrowed'
-      WHERE m.id = ?
-      GROUP BY m.id
-    `, [member_id], (err, member) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (!member) {
-        return res.status(404).json({ error: 'Member not found' });
-      }
-      if (member.membership_status !== 'active') {
-        return res.status(400).json({ error: 'Member account is not active' });
-      }
-      if (member.active_borrowings >= member.max_books) {
-        return res.status(400).json({ error: `Member has reached borrowing limit of ${member.max_books} books` });
-      }
-      
-      // Create borrowing transaction
-      db.run(`
-        INSERT INTO borrowing_transactions (book_id, member_id, due_date, notes)
-        VALUES (?, ?, ?, ?)
-      `, [book_id, member_id, due_date, notes], function(err) {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-        
-        // Update book availability
-        db.run('UPDATE books SET available_copies = available_copies - 1 WHERE id = ?', [book_id], (err) => {
-          if (err) {
-            return res.status(500).json({ error: err.message });
-          }
-          
-          res.status(201).json({ 
-            id: this.lastID, 
-            message: 'Book borrowed successfully',
-            borrowing_id: this.lastID
-          });
-        });
-      });
+    // Check member's borrowing eligibility
+    const member = await Member.findById(member_id);
+    if (!member) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+    if (member.membership_status !== 'active') {
+      return res.status(400).json({ error: 'Member account is not active' });
+    }
+    
+    // Check member's current borrowing limit
+    const activeBorrowings = await BorrowingTransaction.countDocuments({
+      member_id,
+      status: 'borrowed'
     });
-  });
+    
+    if (activeBorrowings >= member.max_books) {
+      return res.status(400).json({ 
+        error: `Member has reached borrowing limit of ${member.max_books} books` 
+      });
+    }
+    
+    // Create borrowing transaction
+    const borrowingTransaction = new BorrowingTransaction({
+      book_id,
+      member_id,
+      due_date,
+      notes
+    });
+    
+    await borrowingTransaction.save();
+    
+    // Update book availability
+    book.available_copies -= 1;
+    await book.save();
+    
+    res.status(201).json({ 
+      id: borrowingTransaction._id, 
+      message: 'Book borrowed successfully',
+      borrowing_id: borrowingTransaction._id
+    });
+  } catch (error) {
+    console.error('Error borrowing book:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Return a book
 router.post('/return/:id', [
   body('return_date').optional().isISO8601().withMessage('Valid return date is required'),
   body('fine_amount').optional().isDecimal().withMessage('Valid fine amount is required')
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-  
-  const { id } = req.params;
-  const { return_date = new Date().toISOString(), fine_amount = 0, notes } = req.body;
-  
-  // Get borrowing transaction
-  db.get('SELECT * FROM borrowing_transactions WHERE id = ?', [id], (err, transaction) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
+    
+    const { return_date = new Date().toISOString(), fine_amount = 0, notes } = req.body;
+    
+    // Get borrowing transaction
+    const transaction = await BorrowingTransaction.findById(req.params.id);
     if (!transaction) {
       return res.status(404).json({ error: 'Borrowing transaction not found' });
     }
@@ -199,81 +177,82 @@ router.post('/return/:id', [
       calculatedFine = daysOverdue * 0.50; // $0.50 per day
     }
     
-    // Update borrowing transaction
-    db.run(`
-      UPDATE borrowing_transactions 
-      SET return_date = ?, status = 'returned', fine_amount = ?, notes = ?
-      WHERE id = ?
-    `, [return_date, calculatedFine, notes, id], function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      
-      // Update book availability
-      db.run('UPDATE books SET available_copies = available_copies + 1 WHERE id = ?', [transaction.book_id], (err) => {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-        
-        res.json({ 
-          message: 'Book returned successfully',
-          fine_amount: calculatedFine
-        });
-      });
+    // Update transaction
+    transaction.return_date = return_date;
+    transaction.status = 'returned';
+    transaction.fine_amount = calculatedFine;
+    if (notes) transaction.notes = notes;
+    
+    await transaction.save();
+    
+    // Update book availability
+    const book = await Book.findById(transaction.book_id);
+    if (book) {
+      book.available_copies += 1;
+      await book.save();
+    }
+    
+    res.json({ 
+      message: 'Book returned successfully',
+      fine_amount: calculatedFine
     });
-  });
+  } catch (error) {
+    console.error('Error returning book:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Get overdue books
-router.get('/overdue', (req, res) => {
-  const sql = `
-    SELECT bt.*, 
-           b.title, b.author, b.isbn,
-           m.name as member_name, m.email as member_email, m.phone as member_phone
-    FROM borrowing_transactions bt
-    JOIN books b ON bt.book_id = b.id
-    JOIN members m ON bt.member_id = m.id
-    WHERE bt.status = 'borrowed' AND bt.due_date < datetime('now')
-    ORDER BY bt.due_date ASC
-  `;
-  
-  db.all(sql, (err, overdueBooks) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+router.get('/overdue', async (req, res) => {
+  try {
+    const overdueTransactions = await BorrowingTransaction.find({
+      status: 'borrowed',
+      due_date: { $lt: new Date() }
+    })
+    .populate('book_id', 'title author isbn')
+    .populate('member_id', 'name email phone')
+    .sort({ due_date: 1 });
     
-    // Calculate fines
-    const booksWithFines = overdueBooks.map(book => {
-      const daysOverdue = moment().diff(moment(book.due_date), 'days');
+    // Calculate fines and days overdue
+    const booksWithFines = overdueTransactions.map(transaction => {
+      const transactionObj = transaction.toObject();
+      const daysOverdue = moment().diff(moment(transaction.due_date), 'days');
       const finePerDay = 0.50;
+      
       return {
-        ...book,
+        ...transactionObj,
+        title: transaction.book_id.title,
+        author: transaction.book_id.author,
+        isbn: transaction.book_id.isbn,
+        member_name: transaction.member_id.name,
+        member_email: transaction.member_id.email,
+        member_phone: transaction.member_id.phone,
         days_overdue: daysOverdue,
         calculated_fine: daysOverdue * finePerDay
       };
     });
     
     res.json(booksWithFines);
-  });
+  } catch (error) {
+    console.error('Error fetching overdue books:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Renew a book
 router.post('/renew/:id', [
   body('new_due_date').isISO8601().withMessage('Valid new due date is required')
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-  
-  const { id } = req.params;
-  const { new_due_date } = req.body;
-  
-  // Get borrowing transaction
-  db.get('SELECT * FROM borrowing_transactions WHERE id = ?', [id], (err, transaction) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
+    
+    const { new_due_date } = req.body;
+    
+    // Get borrowing transaction
+    const transaction = await BorrowingTransaction.findById(req.params.id);
     if (!transaction) {
       return res.status(404).json({ error: 'Borrowing transaction not found' });
     }
@@ -282,14 +261,14 @@ router.post('/renew/:id', [
     }
     
     // Update due date
-    db.run('UPDATE borrowing_transactions SET due_date = ? WHERE id = ?', [new_due_date, id], function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      
-      res.json({ message: 'Book renewed successfully' });
-    });
-  });
+    transaction.due_date = new_due_date;
+    await transaction.save();
+    
+    res.json({ message: 'Book renewed successfully' });
+  } catch (error) {
+    console.error('Error renewing book:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 module.exports = router;

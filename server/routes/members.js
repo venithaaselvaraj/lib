@@ -1,112 +1,103 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../database/db');
+const Member = require('../models/Member');
+const BorrowingTransaction = require('../models/BorrowingTransaction');
 const { body, validationResult } = require('express-validator');
 
 // Get all members with optional search and pagination
-router.get('/', (req, res) => {
-  const { search, page = 1, limit = 10, status } = req.query;
-  const offset = (page - 1) * limit;
-  
-  let sql = `
-    SELECT m.*, 
-           COUNT(bt.id) as active_borrowings
-    FROM members m
-    LEFT JOIN borrowing_transactions bt ON m.id = bt.member_id AND bt.status = 'borrowed'
-    WHERE 1=1
-  `;
-  let params = [];
-  
-  if (search) {
-    sql += ' AND (m.name LIKE ? OR m.email LIKE ? OR m.phone LIKE ?)';
-    const searchTerm = `%${search}%`;
-    params.push(searchTerm, searchTerm, searchTerm);
-  }
-  
-  if (status) {
-    sql += ' AND m.membership_status = ?';
-    params.push(status);
-  }
-  
-  sql += ' GROUP BY m.id ORDER BY m.name LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), parseInt(offset));
-  
-  db.all(sql, params, (err, members) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+router.get('/', async (req, res) => {
+  try {
+    const { search, page = 1, limit = 10, status } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
     
-    // Get total count for pagination
-    let countSql = 'SELECT COUNT(*) as total FROM members WHERE 1=1';
-    let countParams = [];
+    let query = {};
     
+    // Add search functionality
     if (search) {
-      countSql += ' AND (name LIKE ? OR email LIKE ? OR phone LIKE ?)';
-      const searchTerm = `%${search}%`;
-      countParams.push(searchTerm, searchTerm, searchTerm);
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } }
+      ];
     }
     
+    // Add status filter
     if (status) {
-      countSql += ' AND membership_status = ?';
-      countParams.push(status);
+      query.membership_status = status;
     }
     
-    db.get(countSql, countParams, (err, result) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
+    const members = await Member.find(query)
+      .sort({ name: 1 })
+      .skip(skip)
+      .limit(limitNum)
+      .populate('active_borrowings');
+    
+    // Get active borrowings count for each member
+    const membersWithBorrowings = await Promise.all(
+      members.map(async (member) => {
+        const activeBorrowings = await BorrowingTransaction.countDocuments({
+          member_id: member._id,
+          status: 'borrowed'
+        });
+        
+        return {
+          ...member.toObject(),
+          active_borrowings: activeBorrowings
+        };
+      })
+    );
+    
+    const total = await Member.countDocuments(query);
+    
+    res.json({
+      members: membersWithBorrowings,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum)
       }
-      
-      res.json({
-        members,
-        pagination: {
-          total: result.total,
-          page: parseInt(page),
-          limit: parseInt(limit),
-          totalPages: Math.ceil(result.total / limit)
-        }
-      });
     });
-  });
+  } catch (error) {
+    console.error('Error fetching members:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Get member by ID with borrowing history
-router.get('/:id', (req, res) => {
-  const { id } = req.params;
-  
-  db.get(`
-    SELECT m.*, 
-           COUNT(bt.id) as active_borrowings
-    FROM members m
-    LEFT JOIN borrowing_transactions bt ON m.id = bt.member_id AND bt.status = 'borrowed'
-    WHERE m.id = ?
-    GROUP BY m.id
-  `, [id], (err, member) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+router.get('/:id', async (req, res) => {
+  try {
+    const member = await Member.findById(req.params.id);
+    
     if (!member) {
       return res.status(404).json({ error: 'Member not found' });
     }
     
-    // Get borrowing history
-    db.all(`
-      SELECT bt.*, b.title, b.author, b.isbn
-      FROM borrowing_transactions bt
-      JOIN books b ON bt.book_id = b.id
-      WHERE bt.member_id = ?
-      ORDER BY bt.borrow_date DESC
-      LIMIT 10
-    `, [id], (err, borrowings) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      
-      res.json({
-        ...member,
-        recentBorrowings: borrowings
-      });
+    // Get active borrowings count
+    const activeBorrowings = await BorrowingTransaction.countDocuments({
+      member_id: req.params.id,
+      status: 'borrowed'
     });
-  });
+    
+    // Get recent borrowing history
+    const recentBorrowings = await BorrowingTransaction.find({
+      member_id: req.params.id
+    })
+    .populate('book_id', 'title author isbn')
+    .sort({ borrow_date: -1 })
+    .limit(10);
+    
+    res.json({
+      ...member.toObject(),
+      active_borrowings: activeBorrowings,
+      recentBorrowings
+    });
+  } catch (error) {
+    console.error('Error fetching member:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Add new member
@@ -114,28 +105,37 @@ router.post('/', [
   body('name').notEmpty().withMessage('Name is required'),
   body('email').isEmail().withMessage('Valid email is required'),
   body('phone').optional().isMobilePhone().withMessage('Valid phone number required')
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-  
-  const { name, email, phone, address, max_books } = req.body;
-  
-  const sql = `
-    INSERT INTO members (name, email, phone, address, max_books)
-    VALUES (?, ?, ?, ?, ?)
-  `;
-  
-  db.run(sql, [name, email, phone, address, max_books || 5], function(err) {
-    if (err) {
-      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        return res.status(400).json({ error: 'Member with this email already exists' });
-      }
-      return res.status(500).json({ error: err.message });
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
-    res.status(201).json({ id: this.lastID, message: 'Member added successfully' });
-  });
+    
+    const { name, email, phone, address, max_books } = req.body;
+    
+    const member = new Member({
+      name,
+      email,
+      phone,
+      address,
+      max_books: max_books || 5
+    });
+    
+    await member.save();
+    
+    res.status(201).json({ 
+      id: member._id, 
+      message: 'Member added successfully',
+      member 
+    });
+  } catch (error) {
+    console.error('Error adding member:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Member with this email already exists' });
+    }
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Update member
@@ -143,59 +143,66 @@ router.put('/:id', [
   body('name').notEmpty().withMessage('Name is required'),
   body('email').isEmail().withMessage('Valid email is required'),
   body('phone').optional().isMobilePhone().withMessage('Valid phone number required')
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-  
-  const { id } = req.params;
-  const { name, email, phone, address, membership_status, max_books } = req.body;
-  
-  const sql = `
-    UPDATE members 
-    SET name = ?, email = ?, phone = ?, address = ?, membership_status = ?, max_books = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `;
-  
-  db.run(sql, [name, email, phone, address, membership_status, max_books, id], function(err) {
-    if (err) {
-      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        return res.status(400).json({ error: 'Member with this email already exists' });
-      }
-      return res.status(500).json({ error: err.message });
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
-    if (this.changes === 0) {
+    
+    const { name, email, phone, address, membership_status, max_books } = req.body;
+    
+    const updatedMember = await Member.findByIdAndUpdate(
+      req.params.id,
+      {
+        name,
+        email,
+        phone,
+        address,
+        membership_status,
+        max_books
+      },
+      { new: true, runValidators: true }
+    );
+    
+    if (!updatedMember) {
       return res.status(404).json({ error: 'Member not found' });
     }
-    res.json({ message: 'Member updated successfully' });
-  });
+    
+    res.json({ message: 'Member updated successfully', member: updatedMember });
+  } catch (error) {
+    console.error('Error updating member:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Member with this email already exists' });
+    }
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Delete member
-router.delete('/:id', (req, res) => {
-  const { id } = req.params;
-  
-  // Check if member has active borrowings
-  db.get('SELECT COUNT(*) as count FROM borrowing_transactions WHERE member_id = ? AND status = "borrowed"', [id], (err, result) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+router.delete('/:id', async (req, res) => {
+  try {
+    // Check if member has active borrowings
+    const activeBorrowings = await BorrowingTransaction.countDocuments({
+      member_id: req.params.id,
+      status: 'borrowed'
+    });
     
-    if (result.count > 0) {
+    if (activeBorrowings > 0) {
       return res.status(400).json({ error: 'Cannot delete member with active borrowings' });
     }
     
-    db.run('DELETE FROM members WHERE id = ?', [id], function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'Member not found' });
-      }
-      res.json({ message: 'Member deleted successfully' });
-    });
-  });
+    const deletedMember = await Member.findByIdAndDelete(req.params.id);
+    
+    if (!deletedMember) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+    
+    res.json({ message: 'Member deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting member:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 module.exports = router;
